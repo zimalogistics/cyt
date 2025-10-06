@@ -1,0 +1,35 @@
+# --- CYT Project Ignore Rules ---
+
+# Python virtual environments
+.venv/
+*/.venv/
+
+# Systemd logs, run artifacts, and bootstrap logs
+logs/*.log
+logs/*.kismet*
+logs/bootstrap-*.log
+
+# Bootstrap and local environment artifacts
+bootstrap/yes/
+bootstrap/.bootstrap.sh.swp
+.envrc
+
+# Local config overrides and generated configs
+etc_cyt/
+secure_credentials/
+
+# Temporary / cache files
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+*.bak
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor backups
+*~
+**/*.log
