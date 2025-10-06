@@ -1,3 +1,21 @@
+# Chasing Your Tail — Zima Logistics Edition
+
+This is an enhanced and production-ready version of **[ArgeliusLabs' Chasing Your Tail](https://github.com/ArgeliusLabs/Chasing-Your-Tail-NG)**, designed by **Zima Logistics** to streamline setup, improve reliability, and enable portable deployments.
+
+### Key Enhancements
+- **Secure Bootstrap (v2.5+)** — fully automated setup, idempotent, and environment-aware.
+- **Portable Kismet Configs** — no hardcoded `/home/kali` paths; works on any user or system.
+- **Automatic Wigle API Integration** — stores credentials securely under `/secure_credentials/`.
+- **Desktop + Systemd Launchers** — one-click or auto-start compatible with GUI or headless systems.
+- **Enhanced Logging & Permissions** — ensures `/logs` and `.venv` always stay consistent.
+
+### Upstream Project
+This project is based on [ArgeliusLabs/Chasing-Your-Tail-NG](https://github.com/ArgeliusLabs/Chasing-Your-Tail-NG), the original Python tool for correlating Wi-Fi and Bluetooth telemetry data.
+
+*(See below for the original README content maintained by ArgeliusLabs.)*
+
+---------------------------------------------------------------------------------------------------------------------------
+
 # Chasing Your Tail (CYT)
 
 A comprehensive Wi-Fi probe request analyzer that monitors and tracks wireless devices by analyzing their probe requests. The system integrates with Kismet for packet capture and WiGLE API for SSID geolocation analysis, featuring advanced surveillance detection capabilities.
