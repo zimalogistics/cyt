@@ -139,6 +139,68 @@ cyt_reset_artifacts() {
   echo "[RESET] Removing project-generated helpers"
   rm -f "$ROOT/bin/refresh_kismet_db.sh" "$ROOT/kismet.db" "$ROOT/.envrc"
   rm -rf "$ROOT/.venv"
+  
+  # ---- reset_wifi.sh (return adapters from monitor to managed & reconnect) ----
+cat > "$ROOT/bin/reset_wifi.sh" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[reset_wifi] starting…"
+
+# You can prevent specific ifaces from being changed by setting KEEP_MON (space-separated)
+# Example: KEEP_MON="wlan1" ./bin/reset_wifi.sh
+KEEP="${KEEP_MON:-}"
+
+# Ensure NetworkManager is present (required for reconnects)
+if ! command -v nmcli >/dev/null 2>&1; then
+  echo "[reset_wifi] nmcli not found; please install NetworkManager" >&2
+  exit 1
+fi
+
+# Collect wireless interfaces known to the kernel
+mapfile -t IFACES < <(iw dev 2>/dev/null | awk '/Interface/ {print $2}')
+
+if [[ ${#IFACES[@]} -eq 0 ]]; then
+  echo "[reset_wifi] no wireless interfaces found"
+  exit 0
+fi
+
+for IF in "${IFACES[@]}"; do
+  # Skip if listed in KEEP_MON
+  if [[ " $KEEP " == *" $IF "* ]]; then
+    echo "[reset_wifi] skipping $IF (in KEEP_MON)"
+    continue
+  fi
+
+  # Determine current type: managed/monitor/etc
+  TYPE="$(iw dev "$IF" info 2>/dev/null | awk '/type/ {print $2; exit}' || echo unknown)"
+
+  # If NetworkManager has it unmanaged, try to re-manage it
+  nmcli dev set "$IF" managed yes >/dev/null 2>&1 || true
+
+  if [[ "$TYPE" == "monitor" || "$TYPE" == "unknown" ]]; then
+    echo "[reset_wifi] restoring $IF from $TYPE -> managed"
+    # Bring it down, flip type, bring up
+    sudo ip link set "$IF" down || true
+    # Prefer modern 'iw' type change; fall back to iwconfig if needed
+    if iw dev "$IF" set type managed 2>/dev/null; then
+      :
+    else
+      iwconfig "$IF" mode managed 2>/dev/null || true
+    fi
+    sudo ip link set "$IF" up || true
+  else
+    echo "[reset_wifi] $IF already type=$TYPE"
+  fi
+
+  # Ask NetworkManager to (re)attach and connect
+  nmcli device connect "$IF" >/dev/null 2>&1 || true
+done
+
+echo "[reset_wifi] done."
+BASH
+chmod +x "$ROOT/bin/reset_wifi.sh"
+# ---- end reset_wifi.sh -------------------------------------------------------
 
   echo "[RESET] Clearing logs (keeping directory)"
   mkdir -p "$ROOT/logs"
@@ -354,19 +416,111 @@ fi
 ln -sfn "$ROOT_LOGS" "$HOME/kismet_logs" || true
 log "Ensured ~/kismet_logs -> $ROOT_LOGS symlink exists (compatibility)"
 
-# 6.5) Auto-detect a Wi-Fi capture interface and configure Kismet
-wifi_if="$(ip -o link show | awk -F': ' '/wl|wlan/ {print $2}' | head -n1 || true)"
-if [[ -n "$wifi_if" ]]; then
-  log "Detected Wi-Fi interface: $wifi_if (will let Kismet set monitor mode automatically)"
-  # Ensure site override exists with both log_prefix and a source line
-  sudo tee /etc/kismet/kismet_site.conf >/dev/null <<EOF
-log_prefix=${ROOT_LOGS}
-source=${wifi_if}:name=wifi,channelhop=true
-EOF
-else
-  warn "No Wi-Fi interface found; Kismet will start but will NOT capture."
-  warn "Plug in a Wi-Fi adapter and re-run ./bootstrap.sh --reset (or just restart kismet after adding a source)."
+# 6.5) Select capture interface & keep onboard online
+info "Step 6.5 — Select capture interface (prefer USB dongle) & protect onboard Wi-Fi"
+
+# Helper: does iface support monitor?
+supports_monitor() {
+  local ifc="$1" phy
+  phy="$(readlink -f "/sys/class/net/$ifc/phy80211" 2>/dev/null || true)"
+  [[ -z "$phy" ]] && return 1
+  # Look for "monitor" in supported interface modes
+  iw phy "$(basename "$phy")" info 2>/dev/null | awk '/Supported interface modes/{flag=1;next} /^\S/{flag=0} flag' | grep -qi monitor
+}
+
+# Enumerate wifi ifaces
+mapfile -t WIFI_IFACES < <(iw dev 2>/dev/null | awk '/Interface/ {print $2}')
+if [[ ${#WIFI_IFACES[@]} -eq 0 ]]; then
+  warn "No wireless interfaces found (iw dev). You can still finish bootstrap; add a dongle later."
 fi
+
+USB_MON=""
+PCI_MON=""
+ONBOARD_IF=""
+for ifc in "${WIFI_IFACES[@]}"; do
+  # Work out bus type
+  devpath="$(readlink -f "/sys/class/net/$ifc/device" 2>/dev/null || true)"
+  if [[ -z "$devpath" ]]; then
+    continue
+  fi
+  bus="$(basename "$(readlink -f "$devpath/subsystem" 2>/dev/null || echo "")")"
+  # Remember a likely onboard candidate (first PCI we see)
+  if [[ "$bus" == "pci" && -z "$ONBOARD_IF" ]]; then
+    ONBOARD_IF="$ifc"
+  fi
+  if supports_monitor "$ifc"; then
+    if [[ "$bus" == "usb" && -z "$USB_MON" ]]; then
+      USB_MON="$ifc"
+    elif [[ "$bus" == "pci" && -z "$PCI_MON" ]]; then
+      PCI_MON="$ifc"
+    fi
+  fi
+done
+
+CAPTURE_IF=""
+if [[ -n "$USB_MON" ]]; then
+  CAPTURE_IF="$USB_MON"
+  log "Selected USB (dongle) interface for capture: $CAPTURE_IF"
+elif [[ -n "$PCI_MON" ]]; then
+  CAPTURE_IF="$PCI_MON"
+  log "No USB monitor-capable dongle found; using PCI (onboard) for capture: $CAPTURE_IF"
+else
+  warn "No monitor-capable Wi-Fi found. Kismet will start but won’t capture until a source is added."
+fi
+
+# Configure Kismet to use the selected capture interface (if any).
+if [[ -n "$CAPTURE_IF" ]]; then
+  sudo mkdir -p /etc/kismet
+  # Ensure a clean 'source=' in kismet_site.conf
+  if ! sudo test -f /etc/kismet/kismet_site.conf; then
+    echo "# created by CYT bootstrap" | sudo tee /etc/kismet/kismet_site.conf >/dev/null
+  fi
+  if sudo grep -q '^source=' /etc/kismet/kismet_site.conf; then
+    sudo sed -i -E "s|^source=.*|source=${CAPTURE_IF}:name=wifi,channelhop=true|" /etc/kismet/kismet_site.conf
+  else
+    echo "source=${CAPTURE_IF}:name=wifi,channelhop=true" | sudo tee -a /etc/kismet/kismet_site.conf >/dev/null
+  fi
+  log "Kismet source set to: source=${CAPTURE_IF}:name=wifi,channelhop=true"
+fi
+
+# Keep onboard managed for internet; set ONLY the capture iface unmanaged.
+# This prevents NetworkManager from fighting Kismet on the capture NIC,
+# while your onboard remains fully managed for Wi-Fi connectivity.
+sudo mkdir -p /etc/NetworkManager/conf.d
+NM_CFG="/etc/NetworkManager/conf.d/10-cyt-unmanaged.conf"
+
+if [[ -n "$CAPTURE_IF" ]]; then
+  # Build list (just the capture iface)
+  sudo tee "$NM_CFG" >/dev/null <<EOF
+[main]
+plugins=keyfile
+
+[keyfile]
+unmanaged-devices=interface-name:${CAPTURE_IF}
+EOF
+  log "Wrote NetworkManager unmanaged rule for: ${CAPTURE_IF}"
+else
+  # If we have no capture iface, don’t leave stale unmanaged rules
+  sudo rm -f "$NM_CFG" 2>/dev/null || true
+  log "Removed NetworkManager unmanaged rule (no capture iface selected)."
+fi
+
+# Reload NetworkManager to apply unmanaged rules
+if command -v nmcli >/dev/null 2>&1; then
+  sudo nmcli general reload || true
+fi
+
+# Helpful summary
+log "Interfaces summary:"
+for ifc in "${WIFI_IFACES[@]}"; do
+  devpath="$(readlink -f "/sys/class/net/$ifc/device" 2>/dev/null || true)"
+  bus="$(basename "$(readlink -f "$devpath/subsystem" 2>/dev/null || echo "")")"
+  sup="no"
+  supports_monitor "$ifc" && sup="yes"
+  mark=""
+  [[ "$ifc" == "$CAPTURE_IF" ]] && mark="(capture)"
+  printf "[BOOTSTRAP]  - %-8s bus=%-4s monitor_capable=%-3s %s\n" "$ifc" "${bus:-?}" "$sup" "$mark"
+done
 
 # 7) Symlink /etc/kismet configs to project (optional, with backups)
 info "Step 7 — Symlink /etc/kismet/*.conf to project (optional)"
