@@ -33,3 +33,14 @@ Thumbs.db
 # Editor backups
 *~
 **/*.log
+
+# --- CYT runtime outputs ---
+logs/
+reports/
+surveillance_reports/
+bin/
+*.bak
+*.backup
+*.csv
+*.md
+*.txt
