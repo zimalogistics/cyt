@@ -136,6 +136,8 @@ class CYTGui:
             bg='#2a2a2a'
         )
         self.creds_status.pack(side=tk.LEFT)
+        # kick off first status refresh
+        self.root.after(800, self.check_status_threaded)
         
     def create_control_buttons(self, parent):
         """Create the main control buttons (Fisher Price style but professional)"""
@@ -343,7 +345,7 @@ class CYTGui:
         # Check credentials
         if self.credential_manager:
             try:
-                token = self.credential_manager.get_wigle_token()
+                token = (self.credential_manager.get_wigle_token() if self.credential_manager else None)
                 if token:
                     self.creds_status.config(text="✅ Credentials: Encrypted", fg='#28a745')
                 else:
@@ -351,8 +353,8 @@ class CYTGui:
             except:
                 self.creds_status.config(text="❌ Credentials: Error", fg='#dc3545')
         else:
-            self.creds_status.config(text="⚠️ Credentials: Optional", fg='#ffaa00')
-            
+            # Optional credential indicator removed (was overwriting valid states)
+            pass
     def check_kismet_running(self):
         """Check if Kismet is running"""
         try:
@@ -384,12 +386,30 @@ class CYTGui:
             return None, str(e)
             
     def check_status_threaded(self):
+            # Schedule periodic status refresh every 30s
+        self.root.after(30000, self.check_status_threaded)
         """Check system status in background"""
         self.log_message("🔍 Checking system status...")
         threading.Thread(target=self._check_status_background, daemon=True).start()
         
     def _check_status_background(self):
+        # --- Ensure credential status updates even if nothing fails ---
+        try:
+            token = (self.credential_manager.get_wigle_token() if self.credential_manager else None)
+            if token:
+                self.creds_status.config(text="✅ Credentials: Encrypted", fg="#28a745")
+            else:
+                self.creds_status.config(text="⚠️ Credentials: Missing", fg="#ffaa00")
+        except Exception as e:
+            self.creds_status.config(text=f"❌ Credentials: Error ({e})", fg="#dc3545")
         """Background status check"""
+        # Ensure credential manager exists
+        if getattr(self, "credential_manager", None) is None:
+            try:
+                from secure_credentials import SecureCredentialManager
+                self.credential_manager = SecureCredentialManager("./secure_credentials")
+            except Exception:
+                self.credential_manager = None
         try:
             # Check Kismet status
             kismet_processes = subprocess.run(['pgrep', '-c', 'kismet'], capture_output=True, text=True)

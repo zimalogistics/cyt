@@ -1,32 +1,30 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Start CYT GUI with proper environment
-# Wait for desktop environment to be ready
-sleep 120
+# Resolve project root
+ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-# Change to the project directory first
-cd /home/matt/Desktop/cytng
+# Load GUI env (contains CYT_MASTER_PASSWORD)
+if [ -f "$ROOT/etc_cyt/env" ]; then
+  # shellcheck source=/dev/null
+  . "$ROOT/etc_cyt/env"
+fi
 
-# Set environment variables for GUI access
-export DISPLAY=:0
-export XDG_RUNTIME_DIR=/run/user/$(id -u)
+# Minimal sanity logging (masked) so we can see what the GUI actually gets
+LOG="$ROOT/gui_startup.log"
+PW_MASK="unset"
+if [ "${CYT_MASTER_PASSWORD-__missing__}" != "__missing__" ] && [ -n "${CYT_MASTER_PASSWORD}" ]; then
+  PW_MASK="set,len=${#CYT_MASTER_PASSWORD}"
+fi
+{
+  echo "$(date) start_gui.sh"
+  echo "ROOT=$ROOT"
+  echo "DISPLAY=${DISPLAY-<unset>}  XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR-<unset>}"
+  echo "CYT_MASTER_PASSWORD:$PW_MASK"
+} >> "$LOG"
 
-# Wait for X server to be available with longer timeout
-timeout_count=0
-while ! xset q &>/dev/null; do
-    echo "$(date): Waiting for X server... (attempt $timeout_count)" >> gui_startup.log
-    sleep 15
-    timeout_count=$((timeout_count + 1))
-    if [ $timeout_count -gt 20 ]; then
-        echo "$(date): ERROR - X server timeout after 300 seconds" >> gui_startup.log
-        exit 1
-    fi
-done
+# Ensure we’re in the project directory
+cd "$ROOT"
 
-echo "$(date): X server available, starting GUI..." >> gui_startup.log
-
-# Start the GUI and log any output
-python3 cyt_gui.py >> gui_startup.log 2>&1 &
-
-# Log success
-echo "$(date): CYT GUI started successfully" >> gui_startup.log
+# Launch the GUI
+exec python3 cyt_gui.py

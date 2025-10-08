@@ -334,6 +334,40 @@ fi
 log "Effective log_prefix entries (should point at ${ROOT_LOGS}):"
 sudo grep -Rn '^log_prefix=' /etc/kismet 2>/dev/null | sed -n '1,120p' || true
 
+# --- Step 6b) Normalize config.json kismet_logs path for current user ---
+CONFIG_FILE="$ROOT/config.json"
+if [[ -f "$CONFIG_FILE" ]]; then
+  CURRENT_USER=$(logname 2>/dev/null || echo "$USER")
+  NEW_PATH="/home/${CURRENT_USER}/Desktop/cyt/logs/*.kismet"
+
+  # Replace whatever is in the file with the correct absolute path
+  sed -i -E \
+    "s#(\"kismet_logs\"[[:space:]]*:[[:space:]]*)\"[^\"]+\"#\1\"${NEW_PATH}\"#" \
+    "$CONFIG_FILE"
+
+  log "Updated kismet_logs path in config.json -> ${NEW_PATH}"
+else
+  warn "config.json not found; skipping kismet_logs path normalization."
+fi
+
+# Back-compat for older tools that expect ~/kismet_logs
+ln -sfn "$ROOT_LOGS" "$HOME/kismet_logs" || true
+log "Ensured ~/kismet_logs -> $ROOT_LOGS symlink exists (compatibility)"
+
+# 6.5) Auto-detect a Wi-Fi capture interface and configure Kismet
+wifi_if="$(ip -o link show | awk -F': ' '/wl|wlan/ {print $2}' | head -n1 || true)"
+if [[ -n "$wifi_if" ]]; then
+  log "Detected Wi-Fi interface: $wifi_if (will let Kismet set monitor mode automatically)"
+  # Ensure site override exists with both log_prefix and a source line
+  sudo tee /etc/kismet/kismet_site.conf >/dev/null <<EOF
+log_prefix=${ROOT_LOGS}
+source=${wifi_if}:name=wifi,channelhop=true
+EOF
+else
+  warn "No Wi-Fi interface found; Kismet will start but will NOT capture."
+  warn "Plug in a Wi-Fi adapter and re-run ./bootstrap.sh --reset (or just restart kismet after adding a source)."
+fi
+
 # 7) Symlink /etc/kismet configs to project (optional, with backups)
 info "Step 7 — Symlink /etc/kismet/*.conf to project (optional)"
 if $ASSUME_YES; then
@@ -452,153 +486,221 @@ for f in "$HOME/.config/autostart/cyt-gui.desktop" "$HOME/Desktop/cyt-gui.deskto
 done
 [[ -f "$ROOT/start_gui.sh" ]] && chmod +x "$ROOT/start_gui.sh" || true
 
-# 10) Start Kismet and enforce WebUI user creation (pause + verify)
+# --- 10) Start Kismet and ensure WebUI user exists ---------------------------
 info "Step 10 — Start Kismet and ensure WebUI user exists"
-sudo systemctl enable --now kismet.service || true
-sudo systemctl restart kismet.service || true
 
-KISMET_UI_HOST="127.0.0.1"
-KISMET_UI_PORT="2501"
-KISMET_UI="http://${KISMET_UI_HOST}:${KISMET_UI_PORT}"
+# Enable and (re)start Kismet service
+sudo systemctl enable kismet.service >/dev/null 2>&1 || true
+sudo systemctl restart kismet.service
 
-log "Waiting for Kismet Web UI on ${KISMET_UI} ..."
+# Wait for the Web UI before trying to open it (prevents “finished early” race)
+KISMET_UI="http://127.0.0.1:2501"
+log "[BOOTSTRAP] Waiting for Kismet Web UI on ${KISMET_UI} ..."
 ui_up=false
 for i in {1..90}; do
   code=$(curl -s -o /dev/null -w "%{http_code}" "${KISMET_UI}/index.html" || true)
   if [[ "$code" == "200" || "$code" == "302" || "$code" == "401" ]]; then
-    log "Kismet WebUI responded with HTTP $code"
+    log "[BOOTSTRAP] Kismet Web UI responded (HTTP $code)"
     ui_up=true
     break
   fi
   sleep 1
 done
-if ! $ui_up; then
-  err "Web UI didn’t respond with 200/302/401 within 90s."
-  systemctl --no-pager -l status kismet || true
-  journalctl -u kismet -n 60 --no-pager -l | egrep -i 'http|home|web|listen|ui|error|fatal' || true
-  log "You can still try opening: ${KISMET_UI}"
-fi
 
-HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-[[ -z "${HOST_IP:-}" ]] && HOST_IP="127.0.0.1"
-
-cat <<HINT
-Kismet requires an initial admin user created via the Web UI.
-
-Open the Web UI in a browser and create the admin username & password:
-
-  * Local GUI machine:
-      ${KISMET_UI}
-
-  * Another machine on LAN:
-      http://${HOST_IP}:${KISMET_UI_PORT}
-
-  * SSH headless server (from workstation):
-      ssh -L ${KISMET_UI_PORT}:localhost:${KISMET_UI_PORT} ${USER}@${HOSTNAME:-host}
-      Then open: http://localhost:${KISMET_UI_PORT}
-
-After creating the account, you can either paste an API key (recommended)
-or use the username/password you just created.
-HINT
-
-read -r -p "Press Enter once you've created the Kismet admin user in the Web UI..." _
-
-# --- login helpers ---
-attempt_kismet_api_variants() {
-  local key="$1"; local ui="$2"; local code
-  code=$(curl -s -o /dev/null -w "%{http_code}" "${ui}/system/status.json?kismet=${key}" || echo "000")
-  log "API check (?kismet=) returned HTTP $code"; [[ "$code" == "200" ]] && return 0
-  code=$(curl -s -o /dev/null -w "%{http_code}" -H "Kismet-Api-Key: ${key}" "${ui}/system/status.json" || echo "000")
-  log "API check (Kismet-Api-Key:) returned HTTP $code"; [[ "$code" == "200" ]] && return 0
-  code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${key}" "${ui}/system/status.json" || echo "000")
-  log "API check (Authorization: Bearer) returned HTTP $code"; [[ "$code" == "200" ]] && return 0
-  if [[ "${key}" == kismet=* ]]; then
-    local stripped="${key#kismet=}"
-    code=$(curl -s -o /dev/null -w "%{http_code}" "${ui}/system/status.json?kismet=${stripped}" || echo "000")
-    log "API check (stripped kismet=) returned HTTP $code"; [[ "$code" == "200" ]] && return 0
+# Desktop-safe auto-open (skip if no GUI), but ALWAYS pause for you to finish first-time setup
+if $ui_up; then
+  if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    warn "No GUI session detected (DISPLAY/WAYLAND empty)."
+    warn "Open Kismet manually on this machine or from another device (SSH tunnel):"
+    warn "  xdg-open ${KISMET_UI}/   # on a desktop session"
+    warn "  or: ssh -L 2501:localhost:2501 <user>@<host>  # then browse http://127.0.0.1:2501/"
+  else
+    if command -v xdg-open >/dev/null 2>&1; then
+      log "[BOOTSTRAP] Launching Kismet Web UI in default browser..."
+      ( sleep 1; xdg-open "${KISMET_UI}/" >/dev/null 2>&1 ) &
+    else
+      warn "xdg-open not found; please open ${KISMET_UI}/ manually."
+    fi
   fi
-  return 1
-}
-
-attempt_kismet_password_cookie() {
-  local user="$1" pass="$2" ui="$3" cookiefile="$4"
-  rm -f "$cookiefile" 2>/dev/null || true
-  code=$(curl -sS -c "$cookiefile" -u "$user:$pass" -o /dev/null -w "%{http_code}" "${ui}/system/status.json" || echo "000")
-  [[ "$code" == "200" ]] && return 0
-  code=$(curl -sS -c "$cookiefile" -X POST -H "Content-Type: application/json" \
-              -d "{\"user\":\"$user\",\"password\":\"$pass\"}" \
-              -o /dev/null -w "%{http_code}" "${ui}/session/login" || echo "000")
-  [[ "$code" == "200" ]] || return 1
-  code=$(curl -sS -b "$cookiefile" -o /dev/null -w "%{http_code}" "${ui}/system/status.json" || echo "000")
-  [[ "$code" == "200" ]]
-}
-# --- end helpers ---
-
-API_KEY_FILE="$ROOT/secure_credentials/kismet_api.key"
-mkdir -p "$ROOT/secure_credentials"
-chmod 700 "$ROOT/secure_credentials"
+else
+  warn "Web UI didn’t respond within 90 s; you can still try opening ${KISMET_UI}/ manually."
+fi
 
 echo
-read -r -p "Paste Kismet API key (recommended; leave blank to try user/pass instead): " API_KEY_INPUT
+read -r -p "When the Kismet page loads: create the admin user and log in.  Press Enter here when done..." _
 
-if [[ -n "${API_KEY_INPUT:-}" ]]; then
-  if attempt_kismet_api_variants "${API_KEY_INPUT}" "${KISMET_UI}"; then
-    printf "%s\n" "${API_KEY_INPUT}" > "${API_KEY_FILE}"
-    chmod 600 "${API_KEY_FILE}"
-    log "API key validated and saved to ${API_KEY_FILE}"
-  else
-    err "API key validation failed for common variants; falling back to user/password."
-    API_KEY_INPUT=""
-  fi
-fi
+# ---------------------------------------------------------------------------
+# Verify that the Kismet credentials/API key exist and work
+# ---------------------------------------------------------------------------
+CONF_FILE=""
+for path in \
+  "$HOME/.kismet/kismet_httpd.conf" \
+  "/root/.kismet/kismet_httpd.conf" \
+  "/etc/kismet/kismet_httpd.conf"; do
+  [[ -f "$path" ]] && CONF_FILE="$path" && break
+done
 
-if [[ -z "${API_KEY_INPUT}" ]]; then
-  read -r -p "Kismet admin username: " KUSER
-  read -r -s -p "Kismet admin password: " KPASS; echo
-  COOKIE_FILE="$ROOT/secure_credentials/.kismet.cookies"
-  if attempt_kismet_password_cookie "$KUSER" "$KPASS" "$KISMET_UI" "$COOKIE_FILE"; then
-    log "Kismet password login verified for user '$KUSER'"
-    printf "kismet_user=%s\nverified_at=%s\n" "$KUSER" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      > "$ROOT/secure_credentials/kismet_web_user.txt"
-    chmod 600 "$ROOT/secure_credentials/kismet_web_user.txt"
+if [[ -n "$CONF_FILE" ]]; then
+  log "[BOOTSTRAP] Found Kismet HTTPD config: $CONF_FILE"
+  APIKEY=$(grep -E '^apikey=' "$CONF_FILE" | cut -d= -f2- | tr -d '[:space:]')
+  if [[ -n "$APIKEY" ]]; then
+    code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Kismet $APIKEY" \
+      "${KISMET_UI}/system/status.json" || echo "000")
+    if [[ "$code" == "200" ]]; then
+      log "Kismet credentials verified (HTTP 200) — API key valid."
+    else
+      warn "Kismet API key found but verification failed (HTTP $code).  You can re-enter via Web UI → Login."
+    fi
   else
-    err "Login failed with user/password. Consider using the API key (paste the raw key or the 'kismet=<key>' variant)."
-    exit 1
+    warn "No API key found inside $CONF_FILE — maybe the Web UI setup wasn’t completed?"
   fi
+else
+  warn "Couldn’t locate any kismet_httpd.conf file; skipping credential check."
 fi
 
 # 11) GUI env helper (project-local at $ROOT/etc_cyt/env)
 info "Step 11 — GUI env helper (project-local)"
+
 ENV_FILE="$ROOT/etc_cyt/env"
 mkdir -p "$(dirname "$ENV_FILE")"
-if [[ ! -f "$ENV_FILE" ]]; then
-  cat > "$ENV_FILE" <<ENV
+
+# Build / refresh the base env (always correct the runtime dir for the *current* user)
+# We do NOT echo the password here; it’s written below based on user input or existing value.
+cat > "$ENV_FILE" <<'ENV'
 # CYT GUI env (created by bootstrap; project-local)
+# Use the local display (most desktop sessions expose :0 or :1; :0 is fine on Kali live/VM)
 export DISPLAY=':0'
+# IMPORTANT: use the logged-in user runtime dir, NOT root's (prevents GUI perms weirdness)
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 ENV
-  chmod 600 "$ENV_FILE"
-  log "Created GUI env file: $ENV_FILE"
+
+# If a master password is already exported in this shell, persist it to the env file;
+# otherwise (and if we're not in --yes mode) ask once and save it (so GUI won’t block).
+if [[ -n "${CYT_MASTER_PASSWORD:-}" ]]; then
+  printf "\n# Unlock encrypted credentials for GUI\nexport CYT_MASTER_PASSWORD='%s'\n" "${CYT_MASTER_PASSWORD}" >> "$ENV_FILE"
+  log "Persisted CYT_MASTER_PASSWORD from current environment to $ENV_FILE"
 else
-  log "GUI env file already exists: $ENV_FILE"
+  if $ASSUME_YES; then
+    log "CYT_MASTER_PASSWORD not provided (non-interactive); GUI may prompt when needed."
+  else
+    echo
+    read -r -s -p "Create/set CYT master password (used to unlock encrypted credentials): " _MPW; echo
+    if [[ -n "$_MPW" ]]; then
+      printf "\n# Unlock encrypted credentials for GUI\nexport CYT_MASTER_PASSWORD='%s'\n" "$_MPW" >> "$ENV_FILE"
+      log "Stored CYT master password in $ENV_FILE (600)."
+    else
+      log "No master password stored; GUI will prompt on first use."
+    fi
+    unset _MPW
+  fi
 fi
 
-# Ensure start_gui.sh sources the project-local env
+chmod 600 "$ENV_FILE"
+log "GUI env file ready: $ENV_FILE"
+
+# Ensure start_gui.sh sources the project-local env (at the very top)
 if [[ -f "$ROOT/start_gui.sh" ]]; then
-  if ! grep -qE '\. "\$ROOT/etc_cyt/env"|\. "\$HOME/.config/cyt/env"|\. "\$ROOT/etc_cyt/env"$' "$ROOT/start_gui.sh"; then
-    sed -i '1i ROOT="$(cd "$(dirname "$0")" && pwd)"; . "$ROOT/etc_cyt/env" || true' "$ROOT/start_gui.sh"
+  # Insert only once; keep it as the very first line so env is loaded before anything else
+  if ! head -n 1 "$ROOT/start_gui.sh" | grep -q 'ROOT=.*etc_cyt/env'; then
+    # Prepend a single line that resolves $ROOT and sources env
+    tmpf="$(mktemp)"; printf 'ROOT="$(cd "$(dirname "$0")" && pwd)"; . "$ROOT/etc_cyt/env" || true\n' > "$tmpf"
+    cat "$ROOT/start_gui.sh" >> "$tmpf"
+    mv "$tmpf" "$ROOT/start_gui.sh"
     chmod +x "$ROOT/start_gui.sh"
     log "Patched start_gui.sh to source $ROOT/etc_cyt/env"
   else
-    log "start_gui.sh already sources an env file"
+    log "start_gui.sh already sources $ROOT/etc_cyt/env"
   fi
 else
   warn "start_gui.sh not found in $ROOT; skipping env sourcing patch."
 fi
 
-# 12) Autostart entry + Desktop launcher (already installed from templates)
+# --- 12) Autostart entry + Desktop launcher ----------------------------------
 info "Step 12 — Autostart entry + Desktop launcher"
-# (Installed in Step 4b from project templates)
+
+LAUNCHER_NAME="cyt-gui.desktop"
+USER_DESKTOP="$HOME/Desktop"
+AUTOSTART_DIR="$HOME/.config/autostart"
+mkdir -p "$AUTOSTART_DIR" "$USER_DESKTOP"
+
+# Ensure we have a fast, sane start_gui.sh (no long sleeps, no hard-coded paths).
+# If start_gui.sh is missing OR it contains known bad patterns, replace it with a clean one.
+NEED_GUI_WRAP=false
+if [[ ! -f "$ROOT/start_gui.sh" ]]; then
+  NEED_GUI_WRAP=true
+elif grep -qE 'sleep[[:space:]]+120|/home/matt|cd[[:space:]]+/home/.*/cytng' "$ROOT/start_gui.sh"; then
+  NEED_GUI_WRAP=true
+fi
+
+if $NEED_GUI_WRAP; then
+  cat >"$ROOT/start_gui.sh" <<'WRAP'
+#!/usr/bin/env bash
+# Quick launcher for the CYT GUI (or fallbacks)
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+# Project-local GUI env (DISPLAY, XDG_RUNTIME_DIR if present)
+. "$ROOT/etc_cyt/env" 2>/dev/null || true
+
+# If no DISPLAY/Wayland set but we appear to be on a typical desktop, try a sensible default.
+if [[ -z "${DISPLAY:-}" && -d "/run/user/$(id -u)" ]]; then
+  export DISPLAY=":0"
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
+cd "$ROOT"
+
+# Prefer an obvious GUI entrypoint if present, else try common names, else fall back to web UI
+if [[ -x "./cyt_gui.sh" ]]; then
+  exec ./cyt_gui.sh
+elif [[ -f "./cyt_gui.py" ]]; then
+  exec python3 ./cyt_gui.py
+elif [[ -f "./gui.py" ]]; then
+  exec python3 ./gui.py
+else
+  # Fallback: open Kismet Web UI—at least gets the user moving
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "http://127.0.0.1:2501/" >/dev/null 2>&1 || true
+  fi
+  echo "CYT GUI entrypoint not found; opened Kismet Web UI instead." >&2
+fi
+WRAP
+  chmod +x "$ROOT/start_gui.sh"
+  log "Installed/updated start_gui.sh (fast launcher, no artificial delays)."
+else
+  log "start_gui.sh already looks good; leaving it as-is."
+fi
+
+# Desktop shortcut (use resolved $ROOT paths; no hard-coded usernames)
+cat >"$USER_DESKTOP/$LAUNCHER_NAME" <<EOF
+[Desktop Entry]
+Type=Application
+Name=CYT GUI
+Comment=Launch Chasing Your Tail (CYT)
+Exec=/usr/bin/env bash -lc 'cd "$ROOT" && ./start_gui.sh'
+Path=$ROOT
+Icon=$ROOT/cyt_ng_logo.png
+Terminal=false
+X-GNOME-Autostart-enabled=true
+EOF
+
+# Ensure executable and copy to autostart
+install -m 755 "$USER_DESKTOP/$LAUNCHER_NAME" "$AUTOSTART_DIR/$LAUNCHER_NAME"
+
+# --- Ownership correction for user environment (handles sudo runs) -----------
+echo "[INFO] Correcting file ownership for logged-in user..."
+RUN_USER=$(logname 2>/dev/null || echo "${SUDO_USER:-$USER}")
+RUN_HOME=$(eval echo "~$RUN_USER")
+if [[ -n "$RUN_USER" && -d "$RUN_HOME" ]]; then
+  chown -R "$RUN_USER":"$RUN_USER" "$RUN_HOME/Desktop/cyt" 2>/dev/null || true
+  chown -R "$RUN_USER":"$RUN_USER" "$RUN_HOME/Desktop/cyt/etc_cyt" 2>/dev/null || true
+  chown "$RUN_USER":"$RUN_USER" \
+        "$RUN_HOME/Desktop/$LAUNCHER_NAME" \
+        "$RUN_HOME/.config/autostart/$LAUNCHER_NAME" 2>/dev/null || true
+fi
+echo "[INFO] Ownership corrected."
+
+echo "[BOOTSTRAP] Desktop launcher and autostart entries created."
 
 # 13) Health checks
 info "Step 13 — Health checks"
