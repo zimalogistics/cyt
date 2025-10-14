@@ -643,17 +643,17 @@ done
 # --- 10) Start Kismet and ensure WebUI user exists ---------------------------
 info "Step 10 — Start Kismet and ensure WebUI user exists"
 
-# Enable and (re)start Kismet service
-sudo systemctl enable kismet.service >/dev/null 2>&1 || true
+# Start Kismet once (no automatic enable at boot)
+sudo systemctl stop kismet.service >/dev/null 2>&1 || true
 sudo systemctl restart kismet.service
 
-# Wait for the Web UI before trying to open it (prevents “finished early” race)
+# Wait for the Web UI before prompting
 KISMET_UI="http://127.0.0.1:2501"
 log "[BOOTSTRAP] Waiting for Kismet Web UI on ${KISMET_UI} ..."
 ui_up=false
 for i in {1..90}; do
   code=$(curl -s -o /dev/null -w "%{http_code}" "${KISMET_UI}/index.html" || true)
-  if [[ "$code" == "200" || "$code" == "302" || "$code" == "401" ]]; then
+  if [[ "$code" =~ ^(200|302|401)$ ]]; then
     log "[BOOTSTRAP] Kismet Web UI responded (HTTP $code)"
     ui_up=true
     break
@@ -661,57 +661,21 @@ for i in {1..90}; do
   sleep 1
 done
 
-# Desktop-safe auto-open (skip if no GUI), but ALWAYS pause for you to finish first-time setup
 if $ui_up; then
   if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-    warn "No GUI session detected (DISPLAY/WAYLAND empty)."
-    warn "Open Kismet manually on this machine or from another device (SSH tunnel):"
-    warn "  xdg-open ${KISMET_UI}/   # on a desktop session"
-    warn "  or: ssh -L 2501:localhost:2501 <user>@<host>  # then browse http://127.0.0.1:2501/"
+    warn "No GUI session detected — open ${KISMET_UI}/ manually or via SSH port-forwarding."
   else
     if command -v xdg-open >/dev/null 2>&1; then
-      log "[BOOTSTRAP] Launching Kismet Web UI in default browser..."
+      log "[BOOTSTRAP] Launching Kismet Web UI in browser..."
       ( sleep 1; xdg-open "${KISMET_UI}/" >/dev/null 2>&1 ) &
-    else
-      warn "xdg-open not found; please open ${KISMET_UI}/ manually."
     fi
   fi
 else
-  warn "Web UI didn’t respond within 90 s; you can still try opening ${KISMET_UI}/ manually."
+  warn "Web UI didn’t respond within 90 s; open ${KISMET_UI}/ manually."
 fi
 
 echo
-read -r -p "When the Kismet page loads: create the admin user and log in.  Press Enter here when done..." _
-
-# ---------------------------------------------------------------------------
-# Verify that the Kismet credentials/API key exist and work
-# ---------------------------------------------------------------------------
-CONF_FILE=""
-for path in \
-  "$HOME/.kismet/kismet_httpd.conf" \
-  "/root/.kismet/kismet_httpd.conf" \
-  "/etc/kismet/kismet_httpd.conf"; do
-  [[ -f "$path" ]] && CONF_FILE="$path" && break
-done
-
-if [[ -n "$CONF_FILE" ]]; then
-  log "[BOOTSTRAP] Found Kismet HTTPD config: $CONF_FILE"
-  APIKEY=$(grep -E '^apikey=' "$CONF_FILE" | cut -d= -f2- | tr -d '[:space:]')
-  if [[ -n "$APIKEY" ]]; then
-    code=$(curl -s -o /dev/null -w "%{http_code}" \
-      -H "Authorization: Kismet $APIKEY" \
-      "${KISMET_UI}/system/status.json" || echo "000")
-    if [[ "$code" == "200" ]]; then
-      log "Kismet credentials verified (HTTP 200) — API key valid."
-    else
-      warn "Kismet API key found but verification failed (HTTP $code).  You can re-enter via Web UI → Login."
-    fi
-  else
-    warn "No API key found inside $CONF_FILE — maybe the Web UI setup wasn’t completed?"
-  fi
-else
-  warn "Couldn’t locate any kismet_httpd.conf file; skipping credential check."
-fi
+read -r -p "When the Kismet page loads, create the admin user and log in. Press Enter here when done..." _
 
 # 11) GUI env helper (project-local at $ROOT/etc_cyt/env)
 info "Step 11 — GUI env helper (project-local)"
@@ -770,41 +734,22 @@ else
   warn "start_gui.sh not found in $ROOT; skipping env sourcing patch."
 fi
 
-# --- 12) Autostart entry + Desktop launcher ----------------------------------
-info "Step 12 — Autostart entry + Desktop launcher"
+# --- 12) Desktop launcher (manual start only; no autostart) ------------------
+info "Step 12 — Desktop launcher only (no auto-start)"
 
 LAUNCHER_NAME="cyt-gui.desktop"
 USER_DESKTOP="$HOME/Desktop"
 AUTOSTART_DIR="$HOME/.config/autostart"
-mkdir -p "$AUTOSTART_DIR" "$USER_DESKTOP"
+mkdir -p "$USER_DESKTOP"
 
-# Ensure we have a fast, sane start_gui.sh (no long sleeps, no hard-coded paths).
-# If start_gui.sh is missing OR it contains known bad patterns, replace it with a clean one.
-NEED_GUI_WRAP=false
+# Ensure we have a valid start_gui.sh
 if [[ ! -f "$ROOT/start_gui.sh" ]]; then
-  NEED_GUI_WRAP=true
-elif grep -qE 'sleep[[:space:]]+120|/home/matt|cd[[:space:]]+/home/.*/cytng' "$ROOT/start_gui.sh"; then
-  NEED_GUI_WRAP=true
-fi
-
-if $NEED_GUI_WRAP; then
   cat >"$ROOT/start_gui.sh" <<'WRAP'
 #!/usr/bin/env bash
-# Quick launcher for the CYT GUI (or fallbacks)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-# Project-local GUI env (DISPLAY, XDG_RUNTIME_DIR if present)
 . "$ROOT/etc_cyt/env" 2>/dev/null || true
-
-# If no DISPLAY/Wayland set but we appear to be on a typical desktop, try a sensible default.
-if [[ -z "${DISPLAY:-}" && -d "/run/user/$(id -u)" ]]; then
-  export DISPLAY=":0"
-  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-fi
-
 cd "$ROOT"
-
-# Prefer an obvious GUI entrypoint if present, else try common names, else fall back to web UI
 if [[ -x "./cyt_gui.sh" ]]; then
   exec ./cyt_gui.sh
 elif [[ -f "./cyt_gui.py" ]]; then
@@ -812,20 +757,16 @@ elif [[ -f "./cyt_gui.py" ]]; then
 elif [[ -f "./gui.py" ]]; then
   exec python3 ./gui.py
 else
-  # Fallback: open Kismet Web UI—at least gets the user moving
   if command -v xdg-open >/dev/null 2>&1; then
     xdg-open "http://127.0.0.1:2501/" >/dev/null 2>&1 || true
   fi
-  echo "CYT GUI entrypoint not found; opened Kismet Web UI instead." >&2
+  echo "CYT GUI not found; opened Kismet Web UI instead." >&2
 fi
 WRAP
   chmod +x "$ROOT/start_gui.sh"
-  log "Installed/updated start_gui.sh (fast launcher, no artificial delays)."
-else
-  log "start_gui.sh already looks good; leaving it as-is."
 fi
 
-# Desktop shortcut (use resolved $ROOT paths; no hard-coded usernames)
+# Create Desktop launcher (but do NOT autostart on login)
 cat >"$USER_DESKTOP/$LAUNCHER_NAME" <<EOF
 [Desktop Entry]
 Type=Application
@@ -835,26 +776,21 @@ Exec=/usr/bin/env bash -lc 'cd "$ROOT" && ./start_gui.sh'
 Path=$ROOT
 Icon=$ROOT/cyt_ng_logo.png
 Terminal=false
-X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-enabled=false
 EOF
 
-# Ensure executable and copy to autostart
-install -m 755 "$USER_DESKTOP/$LAUNCHER_NAME" "$AUTOSTART_DIR/$LAUNCHER_NAME"
+chmod 755 "$USER_DESKTOP/$LAUNCHER_NAME"
+log "[BOOTSTRAP] Desktop launcher created at $USER_DESKTOP/$LAUNCHER_NAME (no auto-start)."
 
-# --- Ownership correction for user environment (handles sudo runs) -----------
-echo "[INFO] Correcting file ownership for logged-in user..."
+# Fix ownership if bootstrap was run via sudo
 RUN_USER=$(logname 2>/dev/null || echo "${SUDO_USER:-$USER}")
 RUN_HOME=$(eval echo "~$RUN_USER")
 if [[ -n "$RUN_USER" && -d "$RUN_HOME" ]]; then
   chown -R "$RUN_USER":"$RUN_USER" "$RUN_HOME/Desktop/cyt" 2>/dev/null || true
-  chown -R "$RUN_USER":"$RUN_USER" "$RUN_HOME/Desktop/cyt/etc_cyt" 2>/dev/null || true
-  chown "$RUN_USER":"$RUN_USER" \
-        "$RUN_HOME/Desktop/$LAUNCHER_NAME" \
-        "$RUN_HOME/.config/autostart/$LAUNCHER_NAME" 2>/dev/null || true
+  chown "$RUN_USER":"$RUN_USER" "$RUN_HOME/Desktop/$LAUNCHER_NAME" 2>/dev/null || true
 fi
-echo "[INFO] Ownership corrected."
 
-echo "[BOOTSTRAP] Desktop launcher and autostart entries created."
+log "[BOOTSTRAP] Desktop launcher ready. CYT will not auto-start on login."
 
 # 13) Health checks
 info "Step 13 — Health checks"
